@@ -3,6 +3,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import { AppShell } from "@/components/layout/app-shell";
 import { getCurrentUserPermissions } from "@/services/permissions.service";
 import { getCurrentSalonContext } from "@/services/salon-context";
+import { getCurrentSalonSettings } from "@/services/settings.service";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -25,9 +26,10 @@ export default async function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
-  const [permissions, salonContext] = await Promise.all([
+  const [permissions, salonContext, salonSettings] = await Promise.all([
     getCurrentUserPermissions(),
     getCurrentSalonContext(),
+    getCurrentSalonSettings(),
   ]);
 
   return (
@@ -38,6 +40,15 @@ export default async function RootLayout({
       <body className="min-h-full">
         <AppShell
           permissions={permissions}
+          salon={
+            salonSettings.settings
+              ? {
+                  name: salonSettings.settings.name,
+                  plan: salonSettings.settings.plan,
+                }
+              : null
+          }
+          salonFallback={salonSettings.state === "unconfigured"}
           salonWarning={salonContext.warningMessage}
         >
           {children}

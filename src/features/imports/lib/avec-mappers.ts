@@ -54,18 +54,29 @@ export function mapAppointmentRow(row: RawExcelRow): Record<string, unknown> {
   const grossValue = normalizeCurrency(readColumn(row, ["Valor", "Valor bruto"]));
   const discountValue = normalizeCurrency(readColumn(row, ["Desconto", "Valor desconto"]));
   const totalValue = normalizeCurrency(readColumn(row, ["Total", "Valor total"]));
+  const mobile =
+    normalizePhone(
+      readColumn(row, ["Celular", "Telefone celular", "WhatsApp"])
+    ) ?? normalizePhone(readColumn(row, ["Telefone", "Fone"]));
 
   return {
     professional_name: normalizeText(
       readColumn(row, ["Profissional", "Profissionais"])
     ),
     appointment_date: normalizeBrazilianDate(
-      readColumn(row, ["Data da comanda", "Data", "Data atendimento"])
+      readColumn(row, [
+        "Data Comanda",
+        "Data da Comanda",
+        "Data da comanda",
+        "Data",
+        "Data Atendimento",
+        "Data do Atendimento",
+      ])
     ),
     service_name: normalizeText(readColumn(row, ["Serviço", "Servico", "Procedimento"])),
     category: normalizeText(readColumn(row, ["Categoria", "Grupo"])),
     client_name: normalizeText(readColumn(row, ["Cliente", "Nome", "Nome do cliente"])),
-    mobile: normalizePhone(readColumn(row, ["Celular", "Telefone celular", "WhatsApp"])),
+    mobile,
     gross_value: grossValue,
     discount_value: discountValue,
     total_value:

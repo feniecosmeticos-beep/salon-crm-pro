@@ -10,10 +10,17 @@ import type { Permission } from "@/types/permissions";
 export function AppShell({
   children,
   permissions,
+  salon,
+  salonFallback,
   salonWarning,
 }: {
   children: ReactNode;
   permissions: Permission[];
+  salon: {
+    name: string;
+    plan: string | null;
+  } | null;
+  salonFallback: boolean;
   salonWarning: string | null;
 }) {
   const pathname = usePathname();
@@ -25,7 +32,11 @@ export function AppShell({
   return (
     <div className="min-h-screen bg-background text-foreground">
       <div className="flex min-h-screen">
-        <Sidebar permissions={permissions} />
+        <Sidebar
+          permissions={permissions}
+          salon={salon}
+          salonFallback={salonFallback}
+        />
         <div className="flex min-w-0 flex-1 flex-col">
           <Topbar permissions={permissions} />
           <main className="min-h-[calc(100vh-4rem)] px-4 py-5 sm:px-6 sm:py-7 lg:px-8 lg:py-8">

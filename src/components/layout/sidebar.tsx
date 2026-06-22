@@ -124,7 +124,25 @@ export function NavigationList({
   );
 }
 
-export function Sidebar({ permissions }: { permissions: Permission[] }) {
+export function Sidebar({
+  permissions,
+  salon,
+  salonFallback,
+}: {
+  permissions: Permission[];
+  salon: {
+    name: string;
+    plan: string | null;
+  } | null;
+  salonFallback: boolean;
+}) {
+  const salonName = salon?.name ?? (salonFallback ? "Salão Modelo" : "Salão");
+  const salonPlan = salon
+    ? formatPlan(salon.plan)
+    : salonFallback
+      ? "Plano Demo"
+      : "Plano não informado";
+
   return (
     <aside className="hidden w-72 shrink-0 border-r border-sidebar-border bg-sidebar lg:sticky lg:top-0 lg:flex lg:h-screen lg:flex-col">
       <SidebarBrand tone="sidebar" />
@@ -140,10 +158,10 @@ export function Sidebar({ permissions }: { permissions: Permission[] }) {
             </span>
             <div className="min-w-0">
               <p className="truncate text-sm font-semibold text-sidebar-foreground">
-                Salão Modelo
+                {salonName}
               </p>
               <p className="mt-0.5 text-xs text-sidebar-foreground/55">
-                Plano Demo
+                {salonPlan}
               </p>
             </div>
           </div>
@@ -154,4 +172,12 @@ export function Sidebar({ permissions }: { permissions: Permission[] }) {
       </div>
     </aside>
   );
+}
+
+function formatPlan(plan: string | null): string {
+  if (!plan) {
+    return "Plano não informado";
+  }
+
+  return `Plano ${plan.charAt(0).toUpperCase()}${plan.slice(1)}`;
 }
