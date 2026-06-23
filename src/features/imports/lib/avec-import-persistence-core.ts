@@ -77,7 +77,8 @@ export async function persistAvecImportOnServer(
   if (
     ["clients", "attended_clients", "appointments", "product_sales"].includes(
       params.type
-    )
+    ) &&
+    shouldRecalculateMetrics(params.batch)
   ) {
     try {
       await recalculateClientMetrics(params.salonId);
@@ -90,11 +91,13 @@ export async function persistAvecImportOnServer(
 
   const failedRows = rows.length - importedRows;
   const status = getImportStatus(rows.length, importedRows, failedRows, errors);
+  let importLogId: string | undefined;
 
   try {
-    await insertImportLog(supabase, {
+    importLogId = await upsertImportLog(supabase, {
       failedRows,
       fileName: params.fileName,
+      importLogId: params.importLogId,
       importedRows,
       salonId: params.salonId,
       status,
@@ -112,10 +115,18 @@ export async function persistAvecImportOnServer(
     importedRows,
     failedRows,
     errors,
+    batch: params.batch,
+    importLogId,
     status: errors.length > 0 && status === "completed"
       ? "completed_with_errors"
       : status,
   };
+}
+
+function shouldRecalculateMetrics(
+  batch: PersistAvecImportParams["batch"]
+): boolean {
+  return !batch || batch.current === batch.total;
 }
 
 export async function recalculateClientMetrics(salonId: string): Promise<void> {
@@ -762,19 +773,64 @@ async function upsertClientMetrics(
   }
 }
 
-async function insertImportLog(
+async function upsertImportLog(
   supabase: SupabaseServerClient,
   log: {
     failedRows: number;
     fileName: string;
+    importLogId?: string;
     importedRows: number;
     salonId: string;
     status: PersistImportStatus;
     totalRows: number;
     type: AvecImportType;
   }
-): Promise<void> {
-  const { error } = await supabase.from("imports").insert({
+): Promise<string> {
+  if (log.importLogId) {
+    const { data: existingLog, error: lookupError } = await supabase
+      .from("imports")
+      .select("id, total_rows, imported_rows, failed_rows, status")
+      .eq("id", log.importLogId)
+      .eq("salon_id", log.salonId)
+      .maybeSingle();
+
+    if (lookupError) {
+      throw lookupError;
+    }
+
+    if (existingLog) {
+      const totalRows = (existingLog.total_rows ?? 0) + log.totalRows;
+      const importedRows = (existingLog.imported_rows ?? 0) + log.importedRows;
+      const failedRows = (existingLog.failed_rows ?? 0) + log.failedRows;
+      const status = getMergedImportStatus({
+        batchStatus: log.status,
+        existingStatus: existingLog.status,
+        failedRows,
+        importedRows,
+        totalRows,
+      });
+      const { data, error } = await supabase
+        .from("imports")
+        .update({
+          failed_rows: failedRows,
+          imported_rows: importedRows,
+          status,
+          total_rows: totalRows,
+        })
+        .eq("id", existingLog.id)
+        .eq("salon_id", log.salonId)
+        .select("id")
+        .single();
+
+      if (error) {
+        throw error;
+      }
+
+      return data.id;
+    }
+  }
+
+  const { data, error } = await supabase.from("imports").insert({
     failed_rows: log.failedRows,
     file_name: log.fileName,
     file_type: log.type,
@@ -782,11 +838,13 @@ async function insertImportLog(
     salon_id: log.salonId,
     status: log.status,
     total_rows: log.totalRows,
-  });
+  }).select("id").single();
 
   if (error) {
     throw error;
   }
+
+  return data.id;
 }
 
 function getImportStatus(
@@ -800,6 +858,35 @@ function getImportStatus(
   }
 
   if (failedRows > 0 || errors.length > 0) {
+    return "completed_with_errors";
+  }
+
+  return "completed";
+}
+
+function getMergedImportStatus({
+  batchStatus,
+  existingStatus,
+  failedRows,
+  importedRows,
+  totalRows,
+}: {
+  batchStatus: PersistImportStatus;
+  existingStatus?: string | null;
+  failedRows: number;
+  importedRows: number;
+  totalRows: number;
+}): PersistImportStatus {
+  if (totalRows === 0 || importedRows === 0) {
+    return "failed";
+  }
+
+  if (
+    failedRows > 0 ||
+    batchStatus !== "completed" ||
+    existingStatus === "completed_with_errors" ||
+    existingStatus === "failed"
+  ) {
     return "completed_with_errors";
   }
 

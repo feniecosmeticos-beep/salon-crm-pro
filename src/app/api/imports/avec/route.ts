@@ -4,13 +4,19 @@ import { isAvecImportType, validateRows } from "@/features/imports/lib/validator
 import type { ParsedExcelRow } from "@/features/imports/types/avec-import.types";
 import { createAuditLog } from "@/services/audit.service";
 import {
+  AVEC_IMPORT_BATCH_SIZE,
+  type PersistImportBatch,
+} from "@/features/imports/lib/avec-import-persister";
+import {
   getCurrentSalonContext,
   SALON_LINK_REQUIRED_MESSAGE,
 } from "@/services/salon-context";
 import { requirePermission } from "@/services/permissions.service";
 
-const MAX_IMPORT_ROWS = 20_000;
+const MAX_IMPORT_ROWS = AVEC_IMPORT_BATCH_SIZE;
 const MAX_FILE_NAME_LENGTH = 255;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export async function POST(request: Request) {
   try {
@@ -84,7 +90,29 @@ export async function POST(request: Request) {
       body.rows.length > MAX_IMPORT_ROWS
     ) {
       return NextResponse.json(
-        { error: "Linhas de importação inválidas." },
+        {
+          error: `Cada lote de importação deve ter no máximo ${MAX_IMPORT_ROWS} registros.`,
+        },
+        { status: 400 }
+      );
+    }
+
+    if (
+      body.importLogId !== undefined &&
+      (typeof body.importLogId !== "string" ||
+        !UUID_PATTERN.test(body.importLogId))
+    ) {
+      return NextResponse.json(
+        { error: "Identificador da importação inválido." },
+        { status: 400 }
+      );
+    }
+
+    const batch = parseBatch(body.batch);
+
+    if (body.batch !== undefined && !batch) {
+      return NextResponse.json(
+        { error: "Informações do lote inválidas." },
         { status: 400 }
       );
     }
@@ -108,7 +136,9 @@ export async function POST(request: Request) {
     }
 
     const result = await persistAvecImportOnServer({
+      batch: batch ?? undefined,
       fileName: body.fileName.trim(),
+      importLogId: body.importLogId,
       rows: validation.validRows,
       salonId: salonContext.salonId,
       type: body.type,
@@ -122,6 +152,9 @@ export async function POST(request: Request) {
         file_name: body.fileName.trim(),
         file_type: body.type,
         imported_rows: result.importedRows,
+        import_log_id: result.importLogId ?? null,
+        batch_current: batch?.current ?? null,
+        batch_total: batch?.total ?? null,
         status: result.status,
         total_rows: result.totalRows,
       },
@@ -136,6 +169,33 @@ export async function POST(request: Request) {
       { status: 500 }
     );
   }
+}
+
+function parseBatch(value: unknown): PersistImportBatch | null {
+  if (value === undefined) {
+    return null;
+  }
+
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  if (
+    !Number.isInteger(value.current) ||
+    !Number.isInteger(value.total) ||
+    typeof value.current !== "number" ||
+    typeof value.total !== "number" ||
+    value.current <= 0 ||
+    value.total <= 0 ||
+    value.current > value.total
+  ) {
+    return null;
+  }
+
+  return {
+    current: value.current,
+    total: value.total,
+  };
 }
 
 function parseRows(value: unknown): ParsedExcelRow[] | null {

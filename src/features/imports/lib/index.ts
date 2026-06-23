@@ -19,11 +19,13 @@ export {
 } from "./normalizers";
 export { isAvecImportType, validateRows } from "./validators";
 export {
+  AVEC_IMPORT_BATCH_SIZE,
   persistAvecImport,
 } from "./avec-import-persister";
 export type {
   PersistAvecImportParams,
   PersistAvecImportResult,
+  PersistImportBatch,
   PersistImportError,
   PersistImportStatus,
 } from "./avec-import-persister";

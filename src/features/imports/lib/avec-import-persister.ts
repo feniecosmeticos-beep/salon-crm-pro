@@ -13,10 +13,19 @@ export type PersistImportError = {
   message: string;
 };
 
+export const AVEC_IMPORT_BATCH_SIZE = 500;
+
+export type PersistImportBatch = {
+  current: number;
+  total: number;
+};
+
 export type PersistAvecImportParams = {
   type: AvecImportType;
   fileName: string;
   rows: ParsedExcelRow[];
+  batch?: PersistImportBatch;
+  importLogId?: string;
 };
 
 export type PersistAvecImportResult = {
@@ -25,11 +34,20 @@ export type PersistAvecImportResult = {
   failedRows: number;
   errors: PersistImportError[];
   status: PersistImportStatus;
+  batch?: PersistImportBatch;
+  durationMs?: number;
+  importLogId?: string;
 };
 
 export async function persistAvecImport(
   params: PersistAvecImportParams
 ): Promise<PersistAvecImportResult> {
+  if (params.rows.length > AVEC_IMPORT_BATCH_SIZE) {
+    throw new Error(
+      `Cada lote de importação deve ter no máximo ${AVEC_IMPORT_BATCH_SIZE} registros.`
+    );
+  }
+
   const response = await fetch("/api/imports/avec", {
     body: JSON.stringify(params),
     headers: {

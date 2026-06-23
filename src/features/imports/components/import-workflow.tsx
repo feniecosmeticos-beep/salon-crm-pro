@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import {
+  AVEC_IMPORT_BATCH_SIZE,
   parseAvecExcel,
   persistAvecImport,
   readExcelFile,
@@ -13,7 +14,10 @@ import type {
   ImportValidationResult,
 } from "@/features/imports/types/avec-import.types";
 import { ImportPreviewTable } from "./import-preview-table";
-import { ImportSummaryCard } from "./import-summary-card";
+import {
+  ImportSummaryCard,
+  type ImportProgress,
+} from "./import-summary-card";
 import { ImportTypeSelector } from "./import-type-selector";
 import { ImportUploadCard } from "./import-upload-card";
 
@@ -24,6 +28,9 @@ export function ImportWorkflow() {
   const [result, setResult] = useState<ImportValidationResult | null>(null);
   const [persistenceResult, setPersistenceResult] =
     useState<PersistAvecImportResult | null>(null);
+  const [importProgress, setImportProgress] = useState<ImportProgress | null>(
+    null
+  );
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -33,6 +40,7 @@ export function ImportWorkflow() {
     setPreview(null);
     setResult(null);
     setPersistenceResult(null);
+    setImportProgress(null);
     setSuccessMessage(null);
 
     if (!nextFile) {
@@ -65,6 +73,7 @@ export function ImportWorkflow() {
     setErrorMessage(null);
     setSuccessMessage(null);
     setPersistenceResult(null);
+    setImportProgress(null);
 
     try {
       const [nextPreview, nextResult] = await Promise.all([
@@ -109,14 +118,90 @@ export function ImportWorkflow() {
     setErrorMessage(null);
     setSuccessMessage(null);
     setPersistenceResult(null);
+    setImportProgress(null);
 
     try {
-      const nextPersistenceResult = await persistAvecImport({
-        fileName: file.name,
-        rows: result.validRows,
-        type: selectedType,
+      const startedAt = performance.now();
+      const batches = chunkRows(result.validRows, AVEC_IMPORT_BATCH_SIZE);
+      let processedRows = 0;
+      let importLogId: string | undefined;
+      const aggregate = createEmptyPersistenceResult();
+
+      for (const [batchIndex, batchRows] of batches.entries()) {
+        const batch = {
+          current: batchIndex + 1,
+          total: batches.length,
+        };
+
+        setImportProgress({
+          currentBatch: batch.current,
+          elapsedMs: Math.round(performance.now() - startedAt),
+          percentage: calculatePercentage(processedRows, result.validRows.length),
+          processedRows,
+          totalBatches: batches.length,
+          totalRows: result.validRows.length,
+        });
+
+        try {
+          const batchResult = await persistAvecImport({
+            batch,
+            fileName: file.name,
+            importLogId,
+            rows: batchRows,
+            type: selectedType,
+          });
+
+          importLogId = batchResult.importLogId ?? importLogId;
+          mergePersistenceResult(aggregate, batchResult);
+        } catch (error) {
+          mergePersistenceResult(aggregate, {
+            batch,
+            errors: batchRows.map((row) => ({
+              message:
+                error instanceof Error
+                  ? error.message
+                  : "Não foi possível importar este lote.",
+              rowIndex: row.index,
+            })),
+            failedRows: batchRows.length,
+            importedRows: 0,
+            status: "failed",
+            totalRows: batchRows.length,
+          });
+        } finally {
+          processedRows += batchRows.length;
+
+          const partialResult = finalizePersistenceResult(aggregate, {
+            batch,
+            durationMs: Math.round(performance.now() - startedAt),
+            importLogId,
+          });
+
+          setImportProgress({
+            currentBatch: batch.current,
+            elapsedMs: partialResult.durationMs ?? 0,
+            percentage: calculatePercentage(
+              processedRows,
+              result.validRows.length
+            ),
+            processedRows,
+            totalBatches: batches.length,
+            totalRows: result.validRows.length,
+          });
+          setPersistenceResult(partialResult);
+        }
+      }
+
+      const nextPersistenceResult = finalizePersistenceResult(aggregate, {
+        batch: {
+          current: batches.length,
+          total: batches.length,
+        },
+        durationMs: Math.round(performance.now() - startedAt),
+        importLogId,
       });
 
+      setImportProgress(null);
       setPersistenceResult(nextPersistenceResult);
 
       if (nextPersistenceResult.status === "failed") {
@@ -146,6 +231,7 @@ export function ImportWorkflow() {
     setPreview(null);
     setResult(null);
     setPersistenceResult(null);
+    setImportProgress(null);
     setErrorMessage(null);
     setSuccessMessage(null);
     setIsProcessing(false);
@@ -161,6 +247,7 @@ export function ImportWorkflow() {
           setPreview(null);
           setResult(null);
           setPersistenceResult(null);
+          setImportProgress(null);
           setErrorMessage(null);
           setSuccessMessage(null);
         }}
@@ -190,6 +277,7 @@ export function ImportWorkflow() {
       ) : null}
       <ImportSummaryCard
         file={file}
+        importProgress={importProgress}
         isPersisting={isPersisting}
         onContinue={handleContinueImport}
         persistenceResult={persistenceResult}
@@ -199,4 +287,73 @@ export function ImportWorkflow() {
       <ImportPreviewTable preview={preview} result={result} />
     </div>
   );
+}
+
+function chunkRows<T>(rows: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+
+  for (let index = 0; index < rows.length; index += size) {
+    chunks.push(rows.slice(index, index + size));
+  }
+
+  return chunks;
+}
+
+function createEmptyPersistenceResult(): PersistAvecImportResult {
+  return {
+    errors: [],
+    failedRows: 0,
+    importedRows: 0,
+    status: "failed",
+    totalRows: 0,
+  };
+}
+
+function mergePersistenceResult(
+  target: PersistAvecImportResult,
+  source: PersistAvecImportResult
+) {
+  target.errors.push(...source.errors);
+  target.failedRows += source.failedRows;
+  target.importedRows += source.importedRows;
+  target.totalRows += source.totalRows;
+}
+
+function finalizePersistenceResult(
+  result: PersistAvecImportResult,
+  metadata: Pick<
+    PersistAvecImportResult,
+    "batch" | "durationMs" | "importLogId"
+  >
+): PersistAvecImportResult {
+  return {
+    ...result,
+    ...metadata,
+    status: getAggregateImportStatus(result),
+  };
+}
+
+function getAggregateImportStatus(
+  result: Pick<
+    PersistAvecImportResult,
+    "errors" | "failedRows" | "importedRows" | "totalRows"
+  >
+): PersistAvecImportResult["status"] {
+  if (result.totalRows === 0 || result.importedRows === 0) {
+    return "failed";
+  }
+
+  if (result.failedRows > 0 || result.errors.length > 0) {
+    return "completed_with_errors";
+  }
+
+  return "completed";
+}
+
+function calculatePercentage(processedRows: number, totalRows: number): number {
+  if (totalRows <= 0) {
+    return 0;
+  }
+
+  return Math.min(100, Math.round((processedRows / totalRows) * 100));
 }
