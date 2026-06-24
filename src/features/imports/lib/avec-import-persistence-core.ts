@@ -70,6 +70,15 @@ type PersistRowsResult = {
   importedRows: number;
 };
 
+type SupabaseErrorInfo = {
+  code: string | null;
+  details: string | null;
+  hint: string | null;
+  json: string;
+  message: string;
+  raw: unknown;
+};
+
 type AppointmentBatchEntry = {
   appointmentDate: string;
   avecCode: string | null;
@@ -1024,9 +1033,8 @@ async function insertAppointmentCandidates({
       };
     }
 
-    console.warn("[AVEC import][persistAppointments] batch insert failed", {
+    logSupabaseInsertError("batch insert failed", firstAttempt.error, {
       candidates: candidates.length,
-      error: firstAttempt.message,
       fallbackSize: BATCH_INSERT_FALLBACK_SIZE,
       traceId: trace.traceId,
     });
@@ -1045,16 +1053,19 @@ async function insertAppointmentCandidates({
         continue;
       }
 
-      const message = `Falha ao inserir grupo de atendimentos: ${chunkAttempt.message}`;
+      logSupabaseInsertError("chunk insert failed", chunkAttempt.error, {
+        candidates: candidateChunk.length,
+        fallbackMode: "line_by_line",
+        traceId: trace.traceId,
+      });
+      const lineResult = await insertAppointmentCandidatesLineByLine({
+        candidates: candidateChunk,
+        supabase,
+        trace,
+      });
 
-      for (const candidate of candidateChunk) {
-        for (const rowIndex of candidate.rowIndexes) {
-          errors.push({
-            rowIndex,
-            message,
-          });
-        }
-      }
+      importedRows += lineResult.importedRows;
+      errors.push(...lineResult.errors);
     }
 
     return {
@@ -1076,7 +1087,7 @@ async function insertAppointmentCandidates({
 async function tryInsertAppointmentCandidateGroup(
   supabase: SupabaseServerClient,
   candidates: AppointmentInsertCandidate[]
-): Promise<{ ok: true } | { message: string; ok: false }> {
+): Promise<{ ok: true } | { error: SupabaseErrorInfo; ok: false }> {
   if (candidates.length === 0) {
     return { ok: true };
   }
@@ -1085,7 +1096,65 @@ async function tryInsertAppointmentCandidateGroup(
     .from("appointments")
     .insert(candidates.map((candidate) => candidate.payload));
 
-  return error ? { message: getErrorMessage(error), ok: false } : { ok: true };
+  return error
+    ? { error: createSupabaseErrorInfo(error), ok: false }
+    : { ok: true };
+}
+
+async function insertAppointmentCandidatesLineByLine({
+  candidates,
+  supabase,
+  trace,
+}: {
+  candidates: AppointmentInsertCandidate[];
+  supabase: SupabaseServerClient;
+  trace: ImportTraceContext;
+}): Promise<PersistRowsResult> {
+  const errors: PersistImportError[] = [];
+  let importedRows = 0;
+  let ignoredDuplicates = 0;
+
+  for (const candidate of candidates) {
+    const attempt = await tryInsertAppointmentCandidateGroup(supabase, [
+      candidate,
+    ]);
+
+    if (attempt.ok) {
+      importedRows += candidate.rowIndexes.length;
+      continue;
+    }
+
+    logSupabaseInsertError("single row insert failed", attempt.error, {
+      appointmentKey: candidate.key,
+      rowIndexes: candidate.rowIndexes,
+      traceId: trace.traceId,
+    });
+
+    if (isUniqueViolation(attempt.error)) {
+      importedRows += candidate.rowIndexes.length;
+      ignoredDuplicates += candidate.rowIndexes.length;
+      continue;
+    }
+
+    for (const rowIndex of candidate.rowIndexes) {
+      errors.push({
+        rowIndex,
+        message: formatSupabaseRowError(attempt.error),
+      });
+    }
+  }
+
+  if (ignoredDuplicates > 0) {
+    console.log("[AVEC import][persistAppointments] duplicate rows ignored", {
+      ignoredDuplicates,
+      traceId: trace.traceId,
+    });
+  }
+
+  return {
+    errors,
+    importedRows,
+  };
 }
 
 async function fetchClientsForAppointmentEntries(
@@ -2373,10 +2442,93 @@ function removeEmptyValues<T extends Record<string, unknown>>(value: T): T {
   ) as T;
 }
 
+function logSupabaseInsertError(
+  event: string,
+  error: SupabaseErrorInfo,
+  context: Record<string, unknown>
+) {
+  console.error(`[AVEC import][persistAppointments] ${event}`, {
+    ...context,
+    error,
+  });
+}
+
+function createSupabaseErrorInfo(error: unknown): SupabaseErrorInfo {
+  if (error instanceof Error) {
+    return {
+      code: null,
+      details: null,
+      hint: null,
+      json: serializeError(error),
+      message: error.message,
+      raw: error,
+    };
+  }
+
+  if (isObjectRecord(error)) {
+    return {
+      code: readErrorField(error, "code"),
+      details: readErrorField(error, "details"),
+      hint: readErrorField(error, "hint"),
+      json: serializeError(error),
+      message: readErrorField(error, "message") ?? "Erro inesperado.",
+      raw: error,
+    };
+  }
+
+  return {
+    code: null,
+    details: null,
+    hint: null,
+    json: serializeError(error),
+    message: "Erro inesperado.",
+    raw: error,
+  };
+}
+
+function formatSupabaseRowError(error: SupabaseErrorInfo): string {
+  const code = error.code ?? "sem_codigo";
+  const details = error.details ? ` - ${error.details}` : "";
+  const hint = error.hint ? ` Hint: ${error.hint}` : "";
+
+  return `[${code}] ${error.message}${details}${hint}`;
+}
+
+function isUniqueViolation(error: SupabaseErrorInfo): boolean {
+  return error.code === "23505";
+}
+
+function readErrorField(
+  error: Record<string, unknown>,
+  field: "code" | "details" | "hint" | "message"
+): string | null {
+  const value = error[field];
+
+  return typeof value === "string" && value.trim().length > 0
+    ? value
+    : null;
+}
+
+function serializeError(error: unknown): string {
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
   }
 
-  return "Erro inesperado.";
+  const supabaseError = createSupabaseErrorInfo(error);
+
+  return supabaseError.message === "Erro inesperado."
+    ? supabaseError.message
+    : formatSupabaseRowError(supabaseError);
 }
