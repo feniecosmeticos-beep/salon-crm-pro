@@ -33,6 +33,7 @@ export type PersistAvecImportResult = {
   importedRows: number;
   failedRows: number;
   errors: PersistImportError[];
+  warnings?: string[];
   status: PersistImportStatus;
   batch?: PersistImportBatch;
   durationMs?: number;

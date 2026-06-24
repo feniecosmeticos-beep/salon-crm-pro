@@ -71,6 +71,15 @@ type PersistRowsResult = {
   importedRows: number;
 };
 
+export type RecalculateClientMetricsBatchResult = {
+  hasMore: boolean;
+  limit: number;
+  nextOffset: number | null;
+  offset: number;
+  processedClients: number;
+  totalClients: number;
+};
+
 type SupabaseErrorInfo = {
   code: string | null;
   details: string | null;
@@ -131,6 +140,8 @@ type ProfessionalLookupMaps = {
 
 const BATCH_INSERT_FALLBACK_SIZE = 100;
 const SUPABASE_SELECT_PAGE_SIZE = 1_000;
+const METRICS_RECALCULATION_PENDING_MESSAGE =
+  "Importação concluída. Métricas serão recalculadas separadamente.";
 
 const IMPORT_HANDLERS: Record<AvecImportType, ImportRowHandler> = {
   clients: persistClientRow,
@@ -169,6 +180,7 @@ export async function persistAvecImportOnServer(
       trace,
     });
     const errors = [...persistRowsResult.errors];
+    const warnings: string[] = [];
     const importedRows = persistRowsResult.importedRows;
 
     if (
@@ -177,13 +189,13 @@ export async function persistAvecImportOnServer(
       )
     ) {
       if (shouldRecalculateMetrics(params.batch)) {
-        try {
-          await recalculateClientMetrics(params.salonId, trace);
-        } catch (error) {
-          errors.push({
-            message: `Falha ao recalcular métricas: ${getErrorMessage(error)}`,
-          });
-        }
+        warnings.push(METRICS_RECALCULATION_PENDING_MESSAGE);
+        console.log("[AVEC import][recalculateMetrics] deferred", {
+          batch: params.batch ?? null,
+          reason: "decoupled_from_import_request",
+          traceId: trace.traceId,
+          type: params.type,
+        });
       } else {
         console.log("[AVEC import][recalculateMetrics] skipped", {
           batch: params.batch ?? null,
@@ -224,6 +236,7 @@ export async function persistAvecImportOnServer(
       importedRows,
       failedRows,
       errors,
+      warnings,
       batch: params.batch,
       importLogId,
       status: errors.length > 0 && status === "completed"
@@ -524,6 +537,98 @@ export async function recalculateClientMetrics(
   }
 }
 
+export async function recalculateClientMetricsBatch(
+  salonId: string,
+  {
+    limit,
+    offset,
+    traceId,
+  }: {
+    limit: number;
+    offset: number;
+    traceId?: string;
+  }
+): Promise<RecalculateClientMetricsBatchResult> {
+  const safeOffset = Math.max(0, Math.floor(offset));
+  const safeLimit = Math.max(1, Math.floor(limit));
+  const metricsTrace = createMetricsBatchTraceContext({
+    limit: safeLimit,
+    offset: safeOffset,
+    traceId,
+  });
+  const totalLabel = createTimerLabel(
+    metricsTrace,
+    "recalculateMetrics.batch"
+  );
+
+  console.time(totalLabel);
+  console.log("[AVEC import][recalculateMetrics] batch start", {
+    limit: safeLimit,
+    offset: safeOffset,
+    traceId: metricsTrace.traceId,
+  });
+
+  const supabase = createSupabaseServerClient();
+  const fetchClientsLabel = createTimerLabel(
+    metricsTrace,
+    "recalculateMetrics.fetchClientBatch"
+  );
+  const from = safeOffset;
+  const to = safeOffset + safeLimit - 1;
+
+  console.time(fetchClientsLabel);
+  const { count, data: clients, error: clientsError } = await supabase
+    .from("clients")
+    .select("*", { count: "exact" })
+    .eq("salon_id", salonId)
+    .order("id", { ascending: true })
+    .range(from, to);
+  console.timeEnd(fetchClientsLabel);
+
+  if (clientsError) {
+    console.timeEnd(totalLabel);
+    throw clientsError;
+  }
+
+  const safeClients = clients ?? [];
+  const totalClients = count ?? safeOffset + safeClients.length;
+  const loopLabel = createTimerLabel(
+    metricsTrace,
+    "recalculateMetrics.clientBatchLoop"
+  );
+  let processedClients = 0;
+
+  console.time(loopLabel);
+  try {
+    for (const client of safeClients) {
+      await recalculateSingleClientMetrics(supabase, salonId, client);
+      processedClients += 1;
+    }
+  } finally {
+    console.log("[AVEC import][recalculateMetrics] batch end", {
+      limit: safeLimit,
+      offset: safeOffset,
+      processedClients,
+      totalClients,
+      traceId: metricsTrace.traceId,
+    });
+    console.timeEnd(loopLabel);
+    console.timeEnd(totalLabel);
+  }
+
+  const nextOffset = safeOffset + processedClients;
+  const hasMore = nextOffset < totalClients && processedClients > 0;
+
+  return {
+    hasMore,
+    limit: safeLimit,
+    nextOffset: hasMore ? nextOffset : null,
+    offset: safeOffset,
+    processedClients,
+    totalClients,
+  };
+}
+
 function createImportTraceContext(
   params: PersistAvecImportOnServerParams
 ): ImportRowsTraceContext {
@@ -545,6 +650,23 @@ function createStandaloneTraceContext(
     fileName: "standalone",
     traceId: createImportTraceId(),
     type,
+  };
+}
+
+function createMetricsBatchTraceContext({
+  limit,
+  offset,
+  traceId,
+}: {
+  limit: number;
+  offset: number;
+  traceId?: string;
+}): ImportTraceContext {
+  return {
+    batchLabel: `${offset}-${offset + limit - 1}`,
+    fileName: "metrics-recalculation",
+    traceId: traceId ?? createImportTraceId(),
+    type: "metrics",
   };
 }
 

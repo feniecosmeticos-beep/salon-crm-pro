@@ -20,6 +20,7 @@ type ImportSummaryCardProps = {
 export type ImportProgress = {
   currentBatch: number;
   elapsedMs: number;
+  label?: string;
   percentage: number;
   processedRows: number;
   totalBatches: number;
@@ -70,8 +71,8 @@ export function ImportSummaryCard({
         <div className="mt-4 rounded-md border border-primary/25 bg-primary/10 p-4">
           <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
             <p className="text-sm font-semibold text-primary">
-              Importando lote {importProgress.currentBatch} de{" "}
-              {importProgress.totalBatches}...
+              {importProgress.label ??
+                `Importando lote ${importProgress.currentBatch} de ${importProgress.totalBatches}...`}
             </p>
             <span className="text-sm font-semibold text-primary">
               {importProgress.percentage}%
@@ -141,6 +142,24 @@ export function ImportSummaryCard({
               {persistenceResult.errors.length > 5 ? (
                 <p className="mt-2 text-xs text-destructive">
                   Mais {persistenceResult.errors.length - 5} erro(s) oculto(s).
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+          {persistenceResult.warnings?.length ? (
+            <div className="mt-4 rounded-md border border-amber-500/25 bg-amber-500/10 p-3">
+              <p className="text-xs font-semibold text-amber-700 dark:text-amber-300">
+                Avisos
+              </p>
+              <ul className="mt-2 space-y-1 text-xs text-amber-700 dark:text-amber-300">
+                {persistenceResult.warnings.slice(0, 5).map((warning, index) => (
+                  <li key={`${warning}-${index}`}>{warning}</li>
+                ))}
+              </ul>
+              {persistenceResult.warnings.length > 5 ? (
+                <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                  Mais {persistenceResult.warnings.length - 5} aviso(s)
+                  oculto(s).
                 </p>
               ) : null}
             </div>

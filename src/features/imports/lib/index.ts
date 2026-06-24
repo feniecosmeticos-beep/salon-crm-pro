@@ -22,6 +22,10 @@ export {
   AVEC_IMPORT_BATCH_SIZE,
   persistAvecImport,
 } from "./avec-import-persister";
+export {
+  METRICS_RECALCULATION_BATCH_SIZE,
+  recalculateMetricsBatch,
+} from "./metrics-recalculator";
 export type {
   PersistAvecImportParams,
   PersistAvecImportResult,
@@ -29,6 +33,7 @@ export type {
   PersistImportError,
   PersistImportStatus,
 } from "./avec-import-persister";
+export type { MetricsRecalculationResult } from "./metrics-recalculator";
 export type {
   AvecImportType,
   ExcelPreview,

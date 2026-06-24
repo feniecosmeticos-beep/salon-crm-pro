@@ -3,8 +3,10 @@
 import { useState } from "react";
 import {
   AVEC_IMPORT_BATCH_SIZE,
+  METRICS_RECALCULATION_BATCH_SIZE,
   parseAvecExcel,
   persistAvecImport,
+  recalculateMetricsBatch,
   readExcelFile,
 } from "@/features/imports/lib";
 import type { PersistAvecImportResult } from "@/features/imports/lib";
@@ -20,6 +22,15 @@ import {
 } from "./import-summary-card";
 import { ImportTypeSelector } from "./import-type-selector";
 import { ImportUploadCard } from "./import-upload-card";
+
+const IMPORT_TYPES_WITH_CLIENT_METRICS: readonly AvecImportType[] = [
+  "attended_clients",
+  "appointments",
+  "clients",
+  "product_sales",
+];
+const IMPORT_METRICS_PENDING_WARNING =
+  "Importação concluída. Métricas serão recalculadas separadamente.";
 
 export function ImportWorkflow() {
   const [selectedType, setSelectedType] = useState<AvecImportType | null>(null);
@@ -209,10 +220,35 @@ export function ImportWorkflow() {
         return;
       }
 
+      let finalPersistenceResult = nextPersistenceResult;
+      const metricsResult = shouldRecalculateMetricsAfterImport(selectedType)
+        ? await recalculateMetricsAfterImport({
+            onProgress: setImportProgress,
+            startedAt,
+          })
+        : null;
+
+      if (metricsResult?.warning) {
+        finalPersistenceResult = appendPersistenceWarnings(
+          finalPersistenceResult,
+          [metricsResult.warning]
+        );
+        setPersistenceResult(finalPersistenceResult);
+      } else if (metricsResult) {
+        finalPersistenceResult = removePersistenceWarnings(
+          finalPersistenceResult,
+          [IMPORT_METRICS_PENDING_WARNING]
+        );
+      }
+
+      setImportProgress(null);
+      setPersistenceResult({
+        ...finalPersistenceResult,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+
       setSuccessMessage(
-        nextPersistenceResult.status === "completed_with_errors"
-          ? "Importação concluída com alertas."
-          : "Importação concluída com sucesso."
+        createSuccessMessage(finalPersistenceResult, metricsResult)
       );
     } catch (error) {
       setErrorMessage(
@@ -289,6 +325,123 @@ export function ImportWorkflow() {
   );
 }
 
+async function recalculateMetricsAfterImport({
+  onProgress,
+  startedAt,
+}: {
+  onProgress: (progress: ImportProgress) => void;
+  startedAt: number;
+}): Promise<{
+  processedClients: number;
+  skipped: boolean;
+  totalClients: number;
+  warning?: string;
+}> {
+  let offset = 0;
+  let processedClients = 0;
+  let totalClients = 0;
+
+  try {
+    while (true) {
+      const currentBatch =
+        Math.floor(offset / METRICS_RECALCULATION_BATCH_SIZE) + 1;
+      const totalBatches =
+        totalClients > 0
+          ? Math.max(
+              1,
+              Math.ceil(totalClients / METRICS_RECALCULATION_BATCH_SIZE)
+            )
+          : currentBatch;
+
+      setMetricsProgress(onProgress, {
+        currentBatch,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        percentage: calculatePercentage(processedClients, totalClients),
+        processedRows: processedClients,
+        totalBatches,
+        totalRows: totalClients,
+      });
+
+      const batchResult = await recalculateMetricsBatch({
+        limit: METRICS_RECALCULATION_BATCH_SIZE,
+        offset,
+      });
+
+      if (batchResult.status === "skipped") {
+        return {
+          processedClients,
+          skipped: true,
+          totalClients,
+          warning:
+            batchResult.message ??
+            IMPORT_METRICS_PENDING_WARNING,
+        };
+      }
+
+      totalClients = batchResult.totalClients;
+      processedClients += batchResult.processedClients;
+
+      setMetricsProgress(onProgress, {
+        currentBatch,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        percentage: calculatePercentage(processedClients, totalClients),
+        processedRows: processedClients,
+        totalBatches: Math.max(
+          1,
+          Math.ceil(totalClients / METRICS_RECALCULATION_BATCH_SIZE)
+        ),
+        totalRows: totalClients,
+      });
+
+      if (!batchResult.hasMore) {
+        return {
+          processedClients,
+          skipped: false,
+          totalClients,
+        };
+      }
+
+      if (batchResult.nextOffset === null || batchResult.nextOffset <= offset) {
+        return {
+          processedClients,
+          skipped: false,
+          totalClients,
+          warning:
+            "Importação concluída. O recálculo de métricas foi interrompido para evitar repetição de lote.",
+        };
+      }
+
+      offset = batchResult.nextOffset;
+    }
+  } catch (error) {
+    return {
+      processedClients,
+      skipped: false,
+      totalClients,
+      warning:
+        error instanceof Error
+          ? `Importação concluída. Não foi possível recalcular métricas automaticamente: ${error.message}`
+          : "Importação concluída. Não foi possível recalcular métricas automaticamente.",
+    };
+  }
+}
+
+function setMetricsProgress(
+  onProgress: (progress: ImportProgress) => void,
+  progress: Omit<ImportProgress, "label">
+) {
+  const total = progress.totalRows;
+  const processed = progress.processedRows;
+
+  onProgress({
+    ...progress,
+    label:
+      total > 0
+        ? `Recalculando métricas ${processed}/${total}...`
+        : "Recalculando métricas...",
+  });
+}
+
 function chunkRows<T>(rows: T[], size: number): T[][] {
   const chunks: T[][] = [];
 
@@ -306,6 +459,7 @@ function createEmptyPersistenceResult(): PersistAvecImportResult {
     importedRows: 0,
     status: "failed",
     totalRows: 0,
+    warnings: [],
   };
 }
 
@@ -317,6 +471,34 @@ function mergePersistenceResult(
   target.failedRows += source.failedRows;
   target.importedRows += source.importedRows;
   target.totalRows += source.totalRows;
+
+  if (source.warnings?.length) {
+    target.warnings = [...(target.warnings ?? []), ...source.warnings];
+  }
+}
+
+function appendPersistenceWarnings(
+  result: PersistAvecImportResult,
+  warnings: string[]
+): PersistAvecImportResult {
+  return {
+    ...result,
+    warnings: [...(result.warnings ?? []), ...warnings],
+  };
+}
+
+function removePersistenceWarnings(
+  result: PersistAvecImportResult,
+  warningsToRemove: string[]
+): PersistAvecImportResult {
+  const warnings = (result.warnings ?? []).filter(
+    (warning) => !warningsToRemove.includes(warning)
+  );
+
+  return {
+    ...result,
+    warnings,
+  };
 }
 
 function finalizePersistenceResult(
@@ -348,6 +530,29 @@ function getAggregateImportStatus(
   }
 
   return "completed";
+}
+
+function shouldRecalculateMetricsAfterImport(type: AvecImportType): boolean {
+  return IMPORT_TYPES_WITH_CLIENT_METRICS.includes(type);
+}
+
+function createSuccessMessage(
+  result: PersistAvecImportResult,
+  metricsResult: Awaited<ReturnType<typeof recalculateMetricsAfterImport>> | null
+): string {
+  if (metricsResult?.warning) {
+    return "Importação concluída. Métricas serão recalculadas separadamente.";
+  }
+
+  if (metricsResult && !metricsResult.skipped) {
+    return result.status === "completed_with_errors"
+      ? "Importação concluída com alertas. Métricas recalculadas separadamente."
+      : "Importação concluída com sucesso. Métricas recalculadas.";
+  }
+
+  return result.status === "completed_with_errors"
+    ? "Importação concluída com alertas."
+    : "Importação concluída com sucesso.";
 }
 
 function calculatePercentage(processedRows: number, totalRows: number): number {
