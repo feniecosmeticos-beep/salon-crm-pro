@@ -67,6 +67,7 @@ type PersistRowsParams = {
 
 type PersistRowsResult = {
   errors: PersistImportError[];
+  ignoredDuplicates?: number;
   importedRows: number;
 };
 
@@ -129,6 +130,7 @@ type ProfessionalLookupMaps = {
 };
 
 const BATCH_INSERT_FALLBACK_SIZE = 100;
+const SUPABASE_SELECT_PAGE_SIZE = 1_000;
 
 const IMPORT_HANDLERS: Record<AvecImportType, ImportRowHandler> = {
   clients: persistClientRow,
@@ -954,17 +956,13 @@ async function fetchExistingAppointmentKeys({
   console.time(label);
   try {
     for (const dateChunk of chunkArray(dates, BATCH_INSERT_FALLBACK_SIZE)) {
-      const { data, error } = await supabase
-        .from("appointments")
-        .select("client_id, service_id, appointment_date, total_value")
-        .eq("salon_id", salonId)
-        .in("appointment_date", dateChunk);
+      const appointments = await fetchAppointmentsByDates(
+        supabase,
+        salonId,
+        dateChunk
+      );
 
-      if (error) {
-        throw error;
-      }
-
-      for (const appointment of data ?? []) {
+      for (const appointment of appointments) {
         const key = createAppointmentDedupKey({
           appointment_date: appointment.appointment_date,
           client_id: appointment.client_id ?? "",
@@ -990,6 +988,52 @@ async function fetchExistingAppointmentKeys({
   }
 }
 
+async function fetchAppointmentsByDates(
+  supabase: SupabaseServerClient,
+  salonId: string,
+  dates: string[]
+): Promise<
+  Array<{
+    appointment_date: string;
+    client_id: string | null;
+    service_id: string | null;
+    total_value: number;
+  }>
+> {
+  const appointments: Array<{
+    appointment_date: string;
+    client_id: string | null;
+    service_id: string | null;
+    total_value: number;
+  }> = [];
+  let from = 0;
+
+  while (true) {
+    const to = from + SUPABASE_SELECT_PAGE_SIZE - 1;
+    const { data, error } = await supabase
+      .from("appointments")
+      .select("id, client_id, service_id, appointment_date, total_value")
+      .eq("salon_id", salonId)
+      .in("appointment_date", dates)
+      .order("id", { ascending: true })
+      .range(from, to);
+
+    if (error) {
+      throw error;
+    }
+
+    appointments.push(...(data ?? []));
+
+    if (!data || data.length < SUPABASE_SELECT_PAGE_SIZE) {
+      break;
+    }
+
+    from += SUPABASE_SELECT_PAGE_SIZE;
+  }
+
+  return appointments;
+}
+
 async function insertAppointmentCandidates({
   candidates,
   supabase,
@@ -1001,6 +1045,7 @@ async function insertAppointmentCandidates({
 }): Promise<PersistRowsResult> {
   const label = createTimerLabel(trace, "persistAppointments.insertAppointments");
   const errors: PersistImportError[] = [];
+  let ignoredDuplicates = 0;
   let importedRows = 0;
 
   if (candidates.length === 0) {
@@ -1033,9 +1078,10 @@ async function insertAppointmentCandidates({
       };
     }
 
-    logSupabaseInsertError("batch insert failed", firstAttempt.error, {
+    logAppointmentInsertAttemptFailure("batch insert failed", firstAttempt.error, {
       candidates: candidates.length,
       fallbackSize: BATCH_INSERT_FALLBACK_SIZE,
+      fallbackMode: "chunks",
       traceId: trace.traceId,
     });
 
@@ -1053,7 +1099,7 @@ async function insertAppointmentCandidates({
         continue;
       }
 
-      logSupabaseInsertError("chunk insert failed", chunkAttempt.error, {
+      logAppointmentInsertAttemptFailure("chunk insert failed", chunkAttempt.error, {
         candidates: candidateChunk.length,
         fallbackMode: "line_by_line",
         traceId: trace.traceId,
@@ -1065,16 +1111,19 @@ async function insertAppointmentCandidates({
       });
 
       importedRows += lineResult.importedRows;
+      ignoredDuplicates += lineResult.ignoredDuplicates ?? 0;
       errors.push(...lineResult.errors);
     }
 
     return {
       errors,
+      ignoredDuplicates,
       importedRows,
     };
   } finally {
     console.log("[AVEC import][persistAppointments] insert result", {
       failedRows: errors.length,
+      ignoredDuplicates,
       importedRows,
       requestedCandidates: candidates.length,
       requestedRows: sumCandidateRows(candidates),
@@ -1124,17 +1173,17 @@ async function insertAppointmentCandidatesLineByLine({
       continue;
     }
 
-    logSupabaseInsertError("single row insert failed", attempt.error, {
-      appointmentKey: candidate.key,
-      rowIndexes: candidate.rowIndexes,
-      traceId: trace.traceId,
-    });
-
     if (isUniqueViolation(attempt.error)) {
       importedRows += candidate.rowIndexes.length;
       ignoredDuplicates += candidate.rowIndexes.length;
       continue;
     }
+
+    logSupabaseInsertError("single row insert failed", attempt.error, {
+      appointmentKey: candidate.key,
+      rowIndexes: candidate.rowIndexes,
+      traceId: trace.traceId,
+    });
 
     for (const rowIndex of candidate.rowIndexes) {
       errors.push({
@@ -1145,7 +1194,7 @@ async function insertAppointmentCandidatesLineByLine({
   }
 
   if (ignoredDuplicates > 0) {
-    console.log("[AVEC import][persistAppointments] duplicate rows ignored", {
+    console.info("[AVEC import][persistAppointments] duplicate rows ignored", {
       ignoredDuplicates,
       traceId: trace.traceId,
     });
@@ -1153,6 +1202,7 @@ async function insertAppointmentCandidatesLineByLine({
 
   return {
     errors,
+    ignoredDuplicates,
     importedRows,
   };
 }
@@ -2451,6 +2501,23 @@ function logSupabaseInsertError(
     ...context,
     error,
   });
+}
+
+function logAppointmentInsertAttemptFailure(
+  event: string,
+  error: SupabaseErrorInfo,
+  context: Record<string, unknown>
+) {
+  if (isUniqueViolation(error)) {
+    console.info(`[AVEC import][persistAppointments] ${event}`, {
+      ...context,
+      duplicateHandling: "fallback_to_identify_and_ignore_23505",
+      error,
+    });
+    return;
+  }
+
+  logSupabaseInsertError(event, error, context);
 }
 
 function createSupabaseErrorInfo(error: unknown): SupabaseErrorInfo {
